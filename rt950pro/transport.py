@@ -40,6 +40,13 @@ __all__ = [
 ]
 
 HANDSHAKE_STRING = b"PROGRAMBT9000U"
+
+# Model strings the driver is allowed to WRITE to (exact match after the
+# handshake strips NULs/spaces). Reads are always allowed so the string can be
+# discovered from the log. An RT-950 Pro reports "RT-950" (no "Pro"), as noted
+# in RADIO_PROTOCOL_WIP.md; anything else is refused so a sibling radio that
+# shares the bootloader handshake cannot be overwritten with an RT-950 Pro image.
+KNOWN_MODELS: Tuple[str, ...] = ("RT-950",)
 ACK = b"\x06"
 END_COMMAND = b"E"
 READ_BLOCK = 0x80
@@ -196,7 +203,7 @@ class CloneSerialTransport:
         self._model = model_raw.decode("ascii", errors="ignore").strip("\x00 ")
         if not self._model:
             raise CloneTransportError("Radio did not return a model identifier")
-        self.logger.debug("Radio model reported as %s", self._model)
+        self.logger.info("Radio model string: %r", self._model)
 
         frame, key = self._build_encryption_frame()
         self._write(frame)
@@ -244,6 +251,7 @@ class CloneSerialTransport:
             segments = DEFAULT_SEGMENTS
         if self._xor_key is None:
             self.handshake()
+        self._require_known_model()
 
         expected = sum(segment.length for segment in segments)
         if len(data) != expected:
@@ -279,6 +287,17 @@ class CloneSerialTransport:
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
+
+    def _require_known_model(self) -> None:
+        """Refuse to write unless the radio identified itself as a known model."""
+
+        model = (self._model or "").strip()
+        if model not in KNOWN_MODELS:
+            raise CloneTransportError(
+                f"Refusing to write: radio reports model {model!r}, which is not in "
+                f"KNOWN_MODELS {KNOWN_MODELS}. If this really is an RT-950 Pro, add "
+                "that exact string to KNOWN_MODELS in transport.py."
+            )
 
     def _write(self, data: bytes) -> None:
         if not data:

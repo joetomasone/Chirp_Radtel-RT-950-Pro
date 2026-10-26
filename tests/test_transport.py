@@ -167,6 +167,28 @@ def test_write_clone_applies_xor() -> None:
     assert payload == _xor_payload(plain, expected_key)
 
 
+def test_read_clone_allows_unknown_model() -> None:
+    responses = _handshake_responses(b"BT-9000     ", b"\xFF" * READ_BLOCK)
+    transport = CloneSerialTransport(FakeSerial(responses), rng=random.Random(0))
+
+    data = transport.read_clone(segments=[TEST_SEGMENT])
+
+    assert data == b"\xFF" * READ_BLOCK
+    assert transport.model == "BT-9000"
+
+
+def test_write_clone_refuses_unknown_model() -> None:
+    fake = FakeSerial(_handshake_responses(b"BT-9000     ", b"\xFF" * READ_BLOCK))
+    transport = CloneSerialTransport(fake, rng=random.Random(0))
+
+    with pytest.raises(CloneTransportError, match="Refusing to write"):
+        transport.write_clone(b"\x00" * READ_BLOCK, segments=[TEST_SEGMENT])
+
+    # The handshake completed, but no data block was sent to the radio.
+    assert transport.model == "BT-9000"
+    assert all(len(record) != READ_BLOCK + 4 for record in fake.write_history)
+
+
 from rt950pro import cli
 
 
