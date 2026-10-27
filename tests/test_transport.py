@@ -253,3 +253,76 @@ def test_cli_clone_write(tmp_path, monkeypatch):
     expected = payload
     assert transport.written[0] == expected
 
+
+
+class ScriptedSerial(FakeSerial):
+    """FakeSerial that answers each write block from a script of replies."""
+
+    def __init__(self, initial_bytes: bytes, block_replies: List[bytes]) -> None:
+        super().__init__(initial_bytes)
+        self.block_replies = list(block_replies)
+        self.flushes = 0
+
+    def write(self, data: bytes) -> int:
+        if len(data) == READ_BLOCK + 4:
+            self.in_data_phase = True
+            if self.block_replies:
+                self._buffer.extend(self.block_replies.pop(0))
+        return super().write(data)
+
+    def reset_input_buffer(self) -> None:
+        # The handshake flushes too; only count flushes once blocks are flowing.
+        if getattr(self, "in_data_phase", False):
+            self.flushes += 1
+            self._buffer.clear()
+
+
+def _handshake_only(model: bytes = b"RT-950      ") -> bytes:
+    return bytes(ACK) + b"\x00" * 16 + model + bytes(ACK)
+
+
+def _block_frames(fake: FakeSerial) -> List[bytes]:
+    return [record for record in fake.write_history if len(record) == READ_BLOCK + 4]
+
+
+def test_write_clone_resends_block_after_bad_ack(monkeypatch) -> None:
+    from rt950pro import transport as transport_module
+
+    monkeypatch.setattr(transport_module.time, "sleep", lambda _s: None)
+    # First reply looks like the radio answering an APRS *read* (0x54 header +
+    # data) instead of an ACK; the second attempt is acknowledged.
+    fake = ScriptedSerial(_handshake_only(), [b"T" + b"\x00" * 131, bytes(ACK)])
+    transport = CloneSerialTransport(fake, rng=random.Random(0))
+
+    transport.write_clone(b"\x01" * READ_BLOCK, segments=[TEST_SEGMENT])
+
+    frames = _block_frames(fake)
+    assert len(frames) == 2 and frames[0] == frames[1]
+    assert fake.flushes == 1, "stale reply bytes must be discarded before the resend"
+    assert fake.write_history[-1] == b"E"
+
+
+def test_write_clone_treats_timeout_as_failed_attempt(monkeypatch) -> None:
+    from rt950pro import transport as transport_module
+
+    monkeypatch.setattr(transport_module.time, "sleep", lambda _s: None)
+    fake = ScriptedSerial(_handshake_only(), [b"", bytes(ACK)])
+    transport = CloneSerialTransport(fake, rng=random.Random(0))
+
+    transport.write_clone(b"\x01" * READ_BLOCK, segments=[TEST_SEGMENT])
+
+    assert len(_block_frames(fake)) == 2
+
+
+def test_write_clone_gives_up_after_three_attempts(monkeypatch) -> None:
+    from rt950pro import transport as transport_module
+
+    monkeypatch.setattr(transport_module.time, "sleep", lambda _s: None)
+    fake = ScriptedSerial(_handshake_only(), [b"T", b"T", b"T"])
+    transport = CloneSerialTransport(fake, rng=random.Random(0))
+
+    with pytest.raises(CloneTransportError, match=r"after 3 attempts.*got 54"):
+        transport.write_clone(b"\x01" * READ_BLOCK, segments=[TEST_SEGMENT])
+
+    assert len(_block_frames(fake)) == 3
+    assert fake.write_history[-1] != b"E", "session must not be closed after a failed write"

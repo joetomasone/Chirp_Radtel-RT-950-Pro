@@ -32,6 +32,7 @@ update the generator or the source modules under `rt950pro/` instead."""
 from __future__ import annotations
 import logging
 import random
+import time
 import unicodedata
 from dataclasses import dataclass, field
 from enum import Enum
@@ -2256,6 +2257,13 @@ ACK = b"\x06"
 END_COMMAND = b"E"
 READ_BLOCK = 0x80
 BLOCK_HEADER = 4
+# The factory CPS resends a block up to three times when the ACK is missing or
+# wrong (RADIO_PROTOCOL_WIP.md). One corrupted byte on the serial link is enough
+# for the radio to answer with something other than 0x06 (a 0x55 write header
+# read as 0x54 makes it reply with a read block instead of an ACK). Rewriting
+# the same bytes to the same address is harmless, so retry before giving up.
+WRITE_ATTEMPTS = 3
+WRITE_RETRY_DELAY = 0.3
 
 ENCRYPT_STRINGS: Tuple[bytes, ...] = (
     b"BHT ",
@@ -2467,13 +2475,7 @@ class CloneSerialTransport:
             payload = self._apply_xor(bytearray(chunk))
             header = bytes((command, (address >> 8) & 0xFF, address & 0xFF, READ_BLOCK))
             self.logger.debug("Writing block: command=0x%02X address=0x%04X", command, address)
-            self._write(header + payload)
-            ack = self._read_exact(1)
-            if ack != ACK:
-                raise CloneTransportError(
-                    f"Write ACK mismatch at 0x{address:04X}: expected 0x06, got {ack.hex()}"
-                )
-            self.logger.debug("Received ACK for 0x%04X", address)
+            self._write_block_with_retry(header + payload, address)
             offset += READ_BLOCK
             done += 1
             if self.progress_cb:
@@ -2498,6 +2500,40 @@ class CloneSerialTransport:
                 f"KNOWN_MODELS {KNOWN_MODELS}. If this really is an RT-950 Pro, add "
                 "that exact string to KNOWN_MODELS in transport.py."
             )
+
+    def _write_block_with_retry(self, frame: bytes, address: int) -> None:
+        """Send one write frame, resending it when the radio does not ACK."""
+
+        last = b""
+        for attempt in range(1, WRITE_ATTEMPTS + 1):
+            self._write(frame)
+            try:
+                last = self._read_exact(1)
+            except CloneTransportError:
+                last = b""
+            if last == ACK:
+                self.logger.debug("Received ACK for 0x%04X", address)
+                return
+            self.logger.warning(
+                "Write ACK mismatch at 0x%04X (attempt %d/%d): expected 0x06, got %s",
+                address,
+                attempt,
+                WRITE_ATTEMPTS,
+                last.hex() or "nothing",
+            )
+            if attempt < WRITE_ATTEMPTS:
+                self._discard_input(WRITE_RETRY_DELAY)
+        raise CloneTransportError(
+            f"Write ACK mismatch at 0x{address:04X} after {WRITE_ATTEMPTS} attempts: "
+            f"expected 0x06, got {last.hex() or 'nothing'}"
+        )
+
+    def _discard_input(self, delay: float) -> None:
+        """Give the radio time to finish talking, then drop whatever it sent."""
+
+        time.sleep(delay)
+        if hasattr(self.serial, "reset_input_buffer"):
+            self.serial.reset_input_buffer()
 
     def _write(self, data: bytes) -> None:
         if not data:

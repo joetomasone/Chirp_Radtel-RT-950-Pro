@@ -201,6 +201,7 @@ def build_monolith(output_path: Path) -> None:
         "from __future__ import annotations",
         "import logging",
         "import random",
+        "import time",
         "import unicodedata",
         "from dataclasses import dataclass, field",
         "from enum import Enum",
